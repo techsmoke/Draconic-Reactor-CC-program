@@ -3,19 +3,27 @@
 --  - NO 'local button = {}'
 --  - NO 'return button'
 --
--- Backwards compatible:
+-- Backwards compatible API used by reactor.lua:
 --   button.setButton(...)
 --   button.clearTable()
---   button.screen([monitor])   -- draw on all monitors or a specific one
---   button.clickEvent()        -- blocks and dispatches monitor touches
+--   button.screen([monitor])
+--   button.clickEvent()
 --
--- New:
+-- Optional:
 --   button.setMonitors({monitor1, monitor2, ...})
 
 button = button or {}
 
--- Internal button storage (NOT on `button` table to avoid conflicts)
-local _buttons = {}
+-- store button definitions inside global table to remain compatible with older scripts
+-- (some scripts iterate pairs(button) and expect the definitions there)
+local _internalKeys = {
+  setMonitors=true, clearTable=true, setButton=true, screen=true, checkxy=true, clickEvent=true
+}
+
+local function _isButtonDef(v)
+  return type(v) == "table" and v.xmin ~= nil and v.ymin ~= nil and v.xmax ~= nil and v.ymax ~= nil
+end
+
 local _monitors = {}
 
 local function _defaultMonitors()
@@ -27,10 +35,8 @@ local function _defaultMonitors()
   end
 end
 
--- Initialize monitor list once (can be overridden later)
 _defaultMonitors()
 
--- Allow main program to provide monitor list explicitly
 function button.setMonitors(ms)
   if type(ms) == "table" and #ms > 0 then
     _monitors = ms
@@ -39,14 +45,16 @@ function button.setMonitors(ms)
   end
 end
 
--- Remove all button definitions
 function button.clearTable()
-  _buttons = {}
+  for k, v in pairs(button) do
+    if _isButtonDef(v) then
+      button[k] = nil
+    end
+  end
 end
 
--- Create/replace a button definition
 function button.setButton(name, title, func, xmin, ymin, xmax, ymax, elem, elem2, color)
-  _buttons[name] = {
+  button[name] = {
     title = tostring(title or ""),
     func  = func,
     xmin  = xmin, ymin = ymin, xmax = xmax, ymax = ymax,
@@ -57,19 +65,17 @@ function button.setButton(name, title, func, xmin, ymin, xmax, ymax, elem, elem2
 end
 
 local function _fill(m, b)
-  m.setBackgroundColor(b.color)
+  m.setBackgroundColor(b.color or colors.blue)
   m.setTextColor(colors.white)
 
   local yMid  = math.floor((b.ymin + b.ymax) / 2)
   local width = (b.xmax - b.xmin)
-  local title = b.title
+  local title = tostring(b.title or "")
   local xMid  = math.floor((width + 1 - #title) / 2)
 
   for y = b.ymin, b.ymax do
     m.setCursorPos(b.xmin, y)
-
     if y == yMid then
-      -- build line with centered title
       if #title > (width + 1) then
         m.write(string.sub(title, 1, width + 1))
       else
@@ -87,12 +93,8 @@ local function _fill(m, b)
   m.setTextColor(colors.white)
 end
 
--- Draw buttons:
---  - if targetMonitor given -> only that one
---  - else -> all known monitors (auto-detect fallback)
 function button.screen(targetMonitor)
   local ms
-
   if targetMonitor then
     ms = { targetMonitor }
   else
@@ -104,26 +106,30 @@ function button.screen(targetMonitor)
   end
 
   for _, m in ipairs(ms) do
-    for _, b in pairs(_buttons) do
-      _fill(m, b)
+    for _, v in pairs(button) do
+      if _isButtonDef(v) then
+        _fill(m, v)
+      end
     end
   end
 end
 
--- Hit test + dispatch
 function button.checkxy(x, y)
-  for _, b in pairs(_buttons) do
-    if y >= b.ymin and y <= b.ymax and x >= b.xmin and x <= b.xmax then
-      if type(b.func) == "function" then
-        b.func(b.elem, b.elem2)
+  for _, v in pairs(button) do
+    if _isButtonDef(v) then
+      if y >= v.ymin and y <= v.ymax and x >= v.xmin and x <= v.xmax then
+        if type(v.func) == "function" then
+          v.func(v.elem, v.elem2)
+        end
+        return true
       end
-      return true
     end
   end
   return false
 end
 
--- Blocking event loop: reacts to monitor_touch from ANY monitor
+-- IMPORTANT: clickEvent MUST be a function reference (for parallel.waitForAny)
+-- so reactor.lua can call: parallel.waitForAny(mainLoop, button.clickEvent)
 function button.clickEvent()
   while true do
     local _, _, x, y = os.pullEvent("monitor_touch")
