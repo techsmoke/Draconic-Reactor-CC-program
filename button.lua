@@ -1,28 +1,43 @@
 -- Multi-monitor button helper (techsmoke)
--- CC:Tweaked os.loadAPI() expects globals in the API environment.
--- So: DO NOT make the main table local.
+-- CC:Tweaked os.loadAPI() compatible (NO 'local button = {}', NO 'return button')
+--
+-- Backwards compatible with old API:
+--   button.setButton(...)
+--   button.clearTable()
+--   button.screen()
+--   button.clickEvent()
+--
+-- New:
+--   button.setMonitors({monitor1, monitor2, ...})
+--   button.screen(monitor)   -- draw on specific monitor (used internally)
 
 button = button or {}
 
-local monitors = {}
+-- internal monitor list (wrapped monitor peripherals)
+local _monitors = {}
 
-local function defaultMonitors()
+local function _defaultMonitors()
   local ms = { peripheral.find("monitor") }
-  if #ms > 0 then monitors = ms end
-end
-
-defaultMonitors()
-
--- New: provide all monitors that should be used for drawing and touch handling
-function button.setMonitors(ms)
-  if type(ms) == "table" and #ms > 0 then
-    monitors = ms
+  if #ms > 0 then
+    _monitors = ms
   else
-    defaultMonitors()
+    _monitors = {}
   end
 end
 
--- Clear only stored button definitions (not API functions)
+-- initialize once at load time (but still works if monitors appear later via setMonitors)
+_defaultMonitors()
+
+-- Provide monitor list from main program (preferred)
+function button.setMonitors(ms)
+  if type(ms) == "table" and #ms > 0 then
+    _monitors = ms
+  else
+    _defaultMonitors()
+  end
+end
+
+-- Clear only button definitions; keep API functions intact
 function button.clearTable()
   for name, data in pairs(button) do
     if type(data) == "table" and data.xmin ~= nil then
@@ -31,18 +46,19 @@ function button.clearTable()
   end
 end
 
+-- Create/replace a button definition
 function button.setButton(name, title, func, xmin, ymin, xmax, ymax, elem, elem2, color)
   button[name] = {
-    title = title,
-    func = func,
-    xmin = xmin, ymin = ymin,
-    xmax = xmax, ymax = ymax,
+    title = tostring(title or ""),
+    func  = func,
+    xmin  = xmin, ymin = ymin, xmax = xmax, ymax = ymax,
     color = color or colors.blue,
-    elem = elem, elem2 = elem2,
+    elem  = elem,
+    elem2 = elem2,
   }
 end
 
-local function fill(m, bData)
+local function _fill(m, bData)
   m.setBackgroundColor(bData.color)
   m.setTextColor(colors.white)
 
@@ -70,24 +86,29 @@ local function fill(m, bData)
   m.setBackgroundColor(colors.black)
 end
 
--- Draw all buttons on one monitor (internal) or all configured monitors
+-- Draw buttons to one monitor or all known monitors
 function button.screen(targetMonitor)
   local ms
   if targetMonitor then
     ms = { targetMonitor }
   else
-    ms = monitors
+    ms = _monitors
+    if #ms == 0 then
+      _defaultMonitors()
+      ms = _monitors
+    end
   end
 
   for _, m in ipairs(ms) do
     for _, data in pairs(button) do
       if type(data) == "table" and data.xmin ~= nil then
-        fill(m, data)
+        _fill(m, data)
       end
     end
   end
 end
 
+-- Hit test + click dispatch
 function button.checkxy(x, y)
   for _, data in pairs(button) do
     if type(data) == "table" and data.xmin ~= nil then
@@ -102,7 +123,7 @@ function button.checkxy(x, y)
   return false
 end
 
--- Blocking touch loop: accepts touches from ANY monitor in the network
+-- Blocking event loop: reacts to monitor_touch from ANY monitor
 function button.clickEvent()
   while true do
     local ev, side, x, y = os.pullEvent("monitor_touch")
