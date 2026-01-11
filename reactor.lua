@@ -11,6 +11,35 @@
 os.loadAPI("lib/f")
 os.loadAPI("lib/button")
 
+-- --- Button API compatibility (older/newer button.lua variants) ---
+if type(button) ~= "table" then error("button API not loaded (lib/button)") end
+if type(button.clearTable) ~= "function" then
+  function button.clearTable()
+    for k,v in pairs(button) do
+      if type(v)=="table" and v.xmin and v.xmax and v.ymin and v.ymax then
+        button[k]=nil
+      end
+    end
+  end
+end
+if type(button.setMonitors) ~= "function" then
+  function button.setMonitors(_) end
+end
+if type(button.clickEvent) ~= "function" then
+  -- minimal monitor_touch dispatcher for button rectangles
+  function button.clickEvent()
+    while true do
+      local ev, side, x, y = os.pullEvent("monitor_touch")
+      for _,b in pairs(button) do
+        if type(b)=="table" and b.func and x>=b.xmin and x<=b.xmax and y>=b.ymin and y<=b.ymax then
+          pcall(b.func)
+        end
+      end
+    end
+  end
+end
+-- ------------------------------------------------------------------
+
 local MODE_STABLE = "STABLE"
 local MODE_FILL   = "FILL"
 
