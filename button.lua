@@ -1,15 +1,9 @@
 -- Multi-monitor button helper (techsmoke)
--- Backwards compatible with old API:
---   button.setButton(...)
---   button.clearTable()
---   button.screen()
---   button.clickEvent()
---
--- New:
---   button.setMonitors({monitor1, monitor2, ...})
---   button.screen(monitor) -- draw on specific monitor (used internally)
+-- CC:Tweaked os.loadAPI() expects globals in the API environment.
+-- So: DO NOT make the main table local.
 
-local button = {}
+button = button or {}
+
 local monitors = {}
 
 local function defaultMonitors()
@@ -19,6 +13,7 @@ end
 
 defaultMonitors()
 
+-- New: provide all monitors that should be used for drawing and touch handling
 function button.setMonitors(ms)
   if type(ms) == "table" and #ms > 0 then
     monitors = ms
@@ -27,15 +22,10 @@ function button.setMonitors(ms)
   end
 end
 
+-- Clear only stored button definitions (not API functions)
 function button.clearTable()
-  for k in pairs(button) do
-    if k ~= "setMonitors" and k ~= "clearTable" and k ~= "setButton" and k ~= "screen" and k ~= "checkxy" and k ~= "clickEvent" then
-      -- leave API
-    end
-  end
-  -- reset button definitions
-  for name in pairs(button) do
-    if type(button[name]) == "table" and button[name].xmin ~= nil then
+  for name, data in pairs(button) do
+    if type(data) == "table" and data.xmin ~= nil then
       button[name] = nil
     end
   end
@@ -48,8 +38,7 @@ function button.setButton(name, title, func, xmin, ymin, xmax, ymax, elem, elem2
     xmin = xmin, ymin = ymin,
     xmax = xmax, ymax = ymax,
     color = color or colors.blue,
-    elem = elem,
-    elem2 = elem2,
+    elem = elem, elem2 = elem2,
   }
 end
 
@@ -81,8 +70,9 @@ local function fill(m, bData)
   m.setBackgroundColor(colors.black)
 end
 
+-- Draw all buttons on one monitor (internal) or all configured monitors
 function button.screen(targetMonitor)
-  local ms = {}
+  local ms
   if targetMonitor then
     ms = { targetMonitor }
   else
@@ -90,7 +80,7 @@ function button.screen(targetMonitor)
   end
 
   for _, m in ipairs(ms) do
-    for name, data in pairs(button) do
+    for _, data in pairs(button) do
       if type(data) == "table" and data.xmin ~= nil then
         fill(m, data)
       end
@@ -99,7 +89,7 @@ function button.screen(targetMonitor)
 end
 
 function button.checkxy(x, y)
-  for name, data in pairs(button) do
+  for _, data in pairs(button) do
     if type(data) == "table" and data.xmin ~= nil then
       if y >= data.ymin and y <= data.ymax and x >= data.xmin and x <= data.xmax then
         if type(data.func) == "function" then
@@ -112,12 +102,10 @@ function button.checkxy(x, y)
   return false
 end
 
+-- Blocking touch loop: accepts touches from ANY monitor in the network
 function button.clickEvent()
   while true do
     local ev, side, x, y = os.pullEvent("monitor_touch")
-    -- Accept touches from ANY monitor in the network
     button.checkxy(x, y)
   end
 end
-
-return button
