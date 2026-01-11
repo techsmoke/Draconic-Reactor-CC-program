@@ -82,7 +82,7 @@ if #monitors == 0 then error("No monitors found on the network") end
 
 local speakers = findAll("speaker") -- can be 0
 
-button.setMonitors(monitors)
+if button.setMonitors then button.setMonitors(monitors) end
 
 -- =========================
 -- Flow gate setup (one-time)
