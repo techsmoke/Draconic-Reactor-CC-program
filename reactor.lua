@@ -1,553 +1,466 @@
--- Draconic Reactor CC Control (techsmoke fork)
--- Goals:
---  - Multi-monitor support (same UI on all monitors)
---  - Multi-speaker alarm + single redstone alarm output
---  - Fill/Stable mode
---  - Output ramp + temperature/safety throttling
---  - DEV logging (default ON) to logs/reactor.csv + logs/events.log
---
--- Dependencies:
---   lib/f.lua
---   lib/button.lua
+-- Draconic Reactor CC Controller (techsmoke fork)
+-- Target: single monitor, robust failsafes, user-set output lock until CRIT.
+-- Install layout (CraftOS): reactor, lib/f, lib/button (no .lua)
+-- Repo layout (GitHub): reactor.lua, f.lua, button.lua
 
 os.loadAPI("lib/f")
 os.loadAPI("lib/button")
 
 -- =========================
--- Settings (persistent)
+-- Config (your spec)
 -- =========================
-settings.load()
+local MODE_STABLE = "STABLE"
+local MODE_FILL   = "FILL"
 
-local function setDefault(key, val)
-  if settings.get(key) == nil then settings.set(key, val) end
+local cfg = {
+  mode = MODE_STABLE,
+
+  -- Output control: user target, CC may clamp only at/above CRIT conditions.
+  targetOutput = 600000,   -- RF/t (or OP/t, whatever the gate uses)
+
+  -- Temp fail-safe (same for both modes)
+  tempWarn     = 5000,
+  tempCrit     = 6000,
+  tempShutdown = 6500,
+
+  -- Field fail-safe (same for both modes)
+  fieldTargetStable = 25,  -- %
+  fieldTargetFill   = 85,  -- % "voll rein"
+  fieldWarn   = 20,        -- %
+  fieldCrit   = 15,        -- %
+  fieldFail   = 10,        -- % trigger
+  fieldRelease= 50,        -- % release threshold (conservative)
+
+  -- Input gate regulation aggressiveness (ΔRF/t per tick)
+  -- Tick here is control loop interval (default 0.2s).
+  stableStep  = 25000,     -- slow correction
+  fillStep    = 120000,    -- fast correction
+  critStepMul = 3.0,       -- when in WARN/CRIT, multiply step
+
+  -- Gate bounds
+  inputMin = 10,           -- keep at least 10 so detection stays sane
+  inputMax = 10000000,     -- 10M RF/t cap (adjust if you want)
+  outputMin = 0,
+  outputMax = 100000000,   -- 100M cap (adjust)
+
+  -- Recovery behavior
+  autoCharge = true,
+  autoActivate = true,
+
+  -- UI
+  uiFps = 6,               -- limit redraw rate to stop flicker
+  loopDt = 0.2,            -- control tick
+}
+
+local CFG_PATH = "reactorconfig.txt"
+
+local function clamp(x, a, b)
+  if x < a then return a end
+  if x > b then return b end
+  return x
 end
 
--- DEV mode default ON for debugging (as requested)
-setDefault("devMode", true)
+local function pct(n, d)
+  if not n or not d or d == 0 then return 0 end
+  local v = (n / d) * 100
+  if v ~= v or v == math.huge or v == -math.huge then return 0 end
+  return v
+end
 
--- Alarm config
-setDefault("alarmSide", "top")          -- one redstone line for ALL alarms
-setDefault("alarmSpeakerEnabled", true)
+local function safeCall(obj, method, ...)
+  if not obj or type(method) ~= "string" then return false end
+  if type(obj[method]) ~= "function" then return false end
+  local ok, res = pcall(obj[method], ...)
+  return ok, res
+end
 
--- Control modes
-setDefault("mode", "fill")              -- "fill" or "stable"
+local function reactorStop(r)
+  if safeCall(r, "shutdownReactor") then return true end
+  if safeCall(r, "stopReactor") then return true end
+  if safeCall(r, "deactivateReactor") then return true end
+  return false
+end
 
--- Fill mode params
-setDefault("outMaxFill", 6500000)       -- rf/t target for fast fill
-setDefault("tempSoftFill", 7400)        -- start throttling output here
-setDefault("rampStepFill", 200000)      -- rf/t per ramp step
-setDefault("rampIntervalFill", 0.4)     -- seconds
+local function reactorCharge(r)
+  return safeCall(r, "chargeReactor")
+end
 
--- Stable mode params
-setDefault("outMaxStable", 800000)      -- cap in stable
-setDefault("tempSoftStable", 7200)
-setDefault("rampStepStable", 50000)
-setDefault("rampIntervalStable", 0.6)
-setDefault("satTarget", 55)             -- %
-setDefault("satBand", 10)               -- +/- band
+local function reactorActivate(r)
+  return safeCall(r, "activateReactor")
+end
 
--- Field control
-setDefault("targetStrength", 50)        -- %
-setDefault("lowFieldHard", 15)          -- emergency cutoff
-setDefault("lowFieldSoft", 30)          -- warning + output throttle kick-in
-setDefault("inputSmooth", 0.35)         -- 0..1, higher = faster response
-setDefault("inMin", 10)
-setDefault("inMax", 50000000)
+local function saveCfg()
+  local fcfg = fs.open(CFG_PATH, "w")
+  fcfg.writeLine(cfg.mode)
+  fcfg.writeLine(tostring(cfg.targetOutput))
+  fcfg.close()
+end
 
--- Safety
-setDefault("maxTemp", 7750)             -- emergency shutdown
-setDefault("safeTempRestart", 3000)
-
--- Save defaults
-settings.save()
+local function loadCfg()
+  if not fs.exists(CFG_PATH) then
+    saveCfg()
+    return
+  end
+  local fcfg = fs.open(CFG_PATH, "r")
+  local m = fcfg.readLine()
+  local to = fcfg.readLine()
+  fcfg.close()
+  if m == MODE_STABLE or m == MODE_FILL then cfg.mode = m end
+  if to then cfg.targetOutput = tonumber(to) or cfg.targetOutput end
+end
 
 -- =========================
 -- Peripherals
 -- =========================
-local function findAll(periphType)
-  local out = {}
-  for _, name in ipairs(peripheral.getNames()) do
-    if peripheral.getType(name) == periphType then
-      out[#out+1] = peripheral.wrap(name)
-    end
-  end
-  return out
-end
-
+local monitor = f.periphSearch("monitor")
 local reactor = f.periphSearch("draconic_reactor")
-if not reactor then error("No draconic_reactor found on the network") end
 
-local monitors = findAll("monitor")
-if #monitors == 0 then error("No monitors found on the network") end
+if not monitor then error("No valid monitor was found") end
+if not reactor then error("No reactor was found") end
 
-local speakers = findAll("speaker") -- can be 0
+local monX, monY = monitor.getSize()
+local mon = { monitor = monitor, X = monX, Y = monY }
+f.firstSet(mon)
 
-if button.setMonitors then button.setMonitors(monitors) end
+-- Flow gate detection (set INPUT low-signal to 10 manually once)
+local function detectFlowGates()
+  local gates = { peripheral.find("flow_gate") }
+  if #gates < 2 then error("Less than 2 flow gates detected!") end
 
--- =========================
--- Flow gate setup (one-time)
--- =========================
-local function listGateNames()
-  local names = {}
-  for _, n in ipairs(peripheral.getNames()) do
-    if peripheral.getType(n) == "flow_gate" then
-      names[#names+1] = n
+  print("Set INPUT flow gate low-signal to 10 (manual). Waiting for detection...")
+  local inputGate, outputGate, inputName, outputName
+
+  while not inputGate do
+    sleep(1)
+    for _, name in pairs(peripheral.getNames()) do
+      if peripheral.getType(name) == "flow_gate" then
+        local gate = peripheral.wrap(name)
+        local ok, setFlow = pcall(gate.getSignalLowFlow)
+        if ok and setFlow == 10 then
+          inputGate, inputName = gate, name
+        else
+          outputGate, outputName = gate, name
+        end
+      end
     end
   end
-  return names
+
+  if not outputGate then error("Could not identify output gate!") end
+
+  local fh = fs.open("flowgate_names.txt", "w")
+  fh.writeLine(inputName)
+  fh.writeLine(outputName)
+  fh.close()
+
+  return inputGate, outputGate, inputName, outputName
 end
 
-local function wrapGate(name)
-  if name and peripheral.isPresent(name) and peripheral.getType(name) == "flow_gate" then
-    return peripheral.wrap(name)
+local function loadFlowGates()
+  if not fs.exists("flowgate_names.txt") then return nil end
+  local fh = fs.open("flowgate_names.txt", "r")
+  local inName = fh.readLine()
+  local outName = fh.readLine()
+  fh.close()
+  if inName and outName and peripheral.isPresent(inName) and peripheral.isPresent(outName) then
+    return peripheral.wrap(inName), peripheral.wrap(outName), inName, outName
   end
   return nil
 end
 
-local function gateGet(g) return g.getSignalLowFlow() end
-local function gateSet(g, v) g.setSignalLowFlow(v) end
-
-local function setupFlowGatesOnce()
-  local gateInName = settings.get("gateInName")
-  local gateOutName = settings.get("gateOutName")
-  local gateIn = wrapGate(gateInName)
-  local gateOut = wrapGate(gateOutName)
-  if gateIn and gateOut and gateInName ~= gateOutName then
-    return gateIn, gateOut
-  end
-
-  -- Need detection
-  local gates = listGateNames()
-  if #gates < 2 then error("Need at least 2 flow_gates on the network") end
-
-  -- show setup text
-  for _, m in ipairs(monitors) do
-    m.setTextScale(0.5)
-    m.setBackgroundColor(colors.black)
-    m.clear()
-    m.setCursorPos(1,1)
-    m.setTextColor(colors.white)
-    m.write("SETUP: Flow gates")
-    m.setCursorPos(1,3)
-    m.write("Set INPUT gate (injector)")
-    m.setCursorPos(1,4)
-    m.write("Signal LOW to 10 RF/t.")
-    m.setCursorPos(1,6)
-    m.write("Waiting...")
-  end
-  print("SETUP: Set INPUT flow gate (injector) Signal LOW to 10 RF/t...")
-
-  local deadline = os.clock() + 60
-  while os.clock() < deadline do
-    local foundIn, foundOut
-    for _, name in ipairs(gates) do
-      local g = peripheral.wrap(name)
-      local v = gateGet(g)
-      if v == 10 then
-        foundIn = name
-      else
-        foundOut = name
-      end
-    end
-    if foundIn and foundOut and foundIn ~= foundOut then
-      settings.set("gateInName", foundIn)
-      settings.set("gateOutName", foundOut)
-      settings.save()
-      print("Detected gateIn="..foundIn.." gateOut="..foundOut)
-      return peripheral.wrap(foundIn), peripheral.wrap(foundOut)
-    end
-    sleep(0.25)
-  end
-
-  error("Flow gate detection timeout. Set INPUT gate to 10 RF/t (Signal LOW).")
-end
-
-local gateIn, gateOut = setupFlowGatesOnce()
-
--- =========================
--- Logging (DEV mode)
--- =========================
-local function ensureDir(path)
-  local dir = fs.getDir(path)
-  if dir ~= "" and not fs.exists(dir) then fs.makeDir(dir) end
-end
-
-ensureDir("logs/reactor.csv")
-ensureDir("logs/events.log")
-
-local function appendLine(path, line)
-  ensureDir(path)
-  local h = fs.open(path, "a")
-  h.writeLine(line)
-  h.close()
-end
-
-local function logEvent(msg)
-  if not settings.get("devMode") then return end
-  appendLine("logs/events.log", tostring(os.epoch("utc")) .. " " .. msg)
-end
-
-local function logHeaderIfMissing()
-  if not settings.get("devMode") then return end
-  if fs.exists("logs/reactor.csv") then
-    local size = fs.getSize("logs/reactor.csv")
-    if size and size > 0 then return end
-  end
-  appendLine("logs/reactor.csv", "ts,status,tempC,fieldPct,satPct,genRFt,fieldInRFt,outGateRFt,inGateRFt,fuelConvNbT,fieldDrainRFt,action")
-end
-
-logHeaderIfMissing()
-
--- =========================
--- Alarm (speakers + redstone)
--- =========================
-local alarmMutedUntil = 0
-
-local function setAlarmRedstone(on)
-  local side = settings.get("alarmSide")
-  if side and redstone and redstone.setOutput then
-    pcall(function() redstone.setOutput(side, on and true or false) end)
-  end
-end
-
-local function playAlarmSound(level)
-  if not settings.get("alarmSpeakerEnabled") then return end
-  if #speakers == 0 then return end
-
-  -- throttle: don't spam
-  local now = os.epoch("utc")
-  if now < alarmMutedUntil then return end
-
-  for _, spk in ipairs(speakers) do
-    pcall(function()
-      -- sound names vary by CC version; "minecraft:block.note_block.pling" is widely available
-      if level == "crit" then
-        spk.playSound("minecraft:block.note_block.bell", 1.0, 0.5)
-      else
-        spk.playSound("minecraft:block.note_block.pling", 1.0, 1.0)
-      end
-    end)
-  end
-end
-
-local function alarm(level, on)
-  setAlarmRedstone(on)
-  if on then
-    playAlarmSound(level)
-  end
+local inputGate, outputGate = loadFlowGates()
+if not inputGate or not outputGate then
+  inputGate, outputGate = detectFlowGates()
 end
 
 -- =========================
--- UI helpers
+-- Gate helpers
 -- =========================
-local function clamp(n, lo, hi)
-  if n < lo then return lo end
-  if n > hi then return hi end
-  return n
+local function getLow(g)
+  local ok, v = pcall(g.getSignalLowFlow)
+  if not ok then return 0 end
+  return tonumber(v) or 0
 end
 
-local function pct(v, vmax)
-  if not vmax or vmax == 0 then return 0 end
-  return math.floor((v / vmax) * 10000) / 100
+local function setLow(g, v)
+  v = math.floor((tonumber(v) or 0) + 0.5)
+  return pcall(g.setSignalLowFlow, v)
 end
 
-local function formatInt(n) return f.format_int(n) end
+-- =========================
+-- UI
+-- =========================
+local lastDraw = 0
+local lastUi = {}
 
-local function getTempColor(t)
-  if t <= 5000 then return colors.green end
-  if t <= 6500 then return colors.orange end
-  return colors.red
+local function bar(width, percent)
+  percent = clamp(percent, 0, 100)
+  local fill = math.floor((percent / 100) * width + 0.5)
+  return string.rep("#", fill) .. string.rep("-", width - fill)
 end
 
-local function getPctColor(p, good, warn)
-  if p >= good then return colors.green end
-  if p >= warn then return colors.orange end
-  return colors.red
+local function writeAt(x, y, txt, col)
+  monitor.setCursorPos(x, y)
+  if col then monitor.setTextColor(col) end
+  monitor.write(txt)
 end
 
-local function drawUI(ri)
-  -- Build buttons once per redraw cycle (button lib draws on all monitors)
+local function clearLine(y)
+  monitor.setCursorPos(1, y)
+  monitor.write(string.rep(" ", monX))
+end
+
+local function drawIfChanged(key, y, line, col)
+  if lastUi[key] ~= line then
+    clearLine(y)
+    writeAt(1, y, line, col)
+    lastUi[key] = line
+  end
+end
+
+local function fmtNum(n)
+  n = tonumber(n) or 0
+  if n >= 1e9 then return string.format("%.2fG", n/1e9) end
+  if n >= 1e6 then return string.format("%.2fM", n/1e6) end
+  if n >= 1e3 then return string.format("%.1fk", n/1e3) end
+  return tostring(math.floor(n+0.5))
+end
+
+local function setButtons()
   button.clearTable()
 
-  local mode = settings.get("mode")
-  local dev = settings.get("devMode") and "ON" or "OFF"
+  local y = 1
+  button.setButton("mode", "MODE", function()
+    cfg.mode = (cfg.mode == MODE_STABLE) and MODE_FILL or MODE_STABLE
+    saveCfg()
+  end, 1, y, 6, y+1, nil, nil, colors.blue)
 
-  -- header + action buttons
-  button.setButton("toggle", "Toggle", function()
-    local s = reactor.getReactorInfo().status
-    if s == "running" then reactor.stopReactor()
-    elseif s == "stopping" then reactor.activateReactor()
-    else reactor.chargeReactor() end
-    logEvent("UI: toggle reactor")
-  end, 2, 1, 12, 3, 0, 0, colors.blue)
+  button.setButton("stop", "STOP", function()
+    reactorStop(reactor)
+  end, 8, y, 13, y+1, nil, nil, colors.red)
 
-  button.setButton("mode", "Mode: "..string.upper(mode), function()
-    local m = settings.get("mode")
-    settings.set("mode", (m == "fill") and "stable" or "fill")
-    settings.save()
-    logEvent("UI: mode="..settings.get("mode"))
-  end, 14, 1, 31, 3, 0, 0, colors.blue)
+  button.setButton("charge", "CHRG", function()
+    reactorCharge(reactor)
+  end, 15, y, 20, y+1, nil, nil, colors.orange)
 
-  button.setButton("dev", "DEV: "..dev, function()
-    settings.set("devMode", not settings.get("devMode"))
-    settings.save()
-    logEvent("UI: devMode="..tostring(settings.get("devMode")))
-    logHeaderIfMissing()
-  end, 33, 1, 44, 3, 0, 0, colors.blue)
+  button.setButton("start", "START", function()
+    reactorActivate(reactor)
+  end, 22, y, 28, y+1, nil, nil, colors.green)
 
-  button.setButton("mute", "Mute 60s", function()
-    alarmMutedUntil = os.epoch("utc") + 60000
-    logEvent("UI: mute 60s")
-  end, 46, 1, 58, 3, 0, 0, colors.blue)
+  local y2 = 4
+  button.setButton("out-100k", "-100k", function()
+    cfg.targetOutput = clamp(cfg.targetOutput - 100000, cfg.outputMin, cfg.outputMax)
+    saveCfg()
+  end, 1, y2, 7, y2+1, nil, nil, colors.gray)
 
-  -- output controls
-  local outLabel = "OUT "..formatInt(gateGet(gateOut))
-  button.setButton("outDown", "-100k", function()
-    gateSet(gateOut, math.max(0, gateGet(gateOut) - 100000))
-    logEvent("UI: out -100k")
-  end, 2, 18, 10, 20, 0, 0, colors.lightBlue)
+  button.setButton("out-10k", "-10k", function()
+    cfg.targetOutput = clamp(cfg.targetOutput - 10000, cfg.outputMin, cfg.outputMax)
+    saveCfg()
+  end, 9, y2, 14, y2+1, nil, nil, colors.gray)
 
-  button.setButton("outUp", "+100k", function()
-    gateSet(gateOut, gateGet(gateOut) + 100000)
-    logEvent("UI: out +100k")
-  end, 12, 18, 20, 20, 0, 0, colors.lightBlue)
+  button.setButton("out+10k", "+10k", function()
+    cfg.targetOutput = clamp(cfg.targetOutput + 10000, cfg.outputMin, cfg.outputMax)
+    saveCfg()
+  end, 16, y2, 21, y2+1, nil, nil, colors.gray)
 
-  button.setButton("outUpBig", "+1M", function()
-    gateSet(gateOut, gateGet(gateOut) + 1000000)
-    logEvent("UI: out +1M")
-  end, 22, 18, 28, 20, 0, 0, colors.lightBlue)
+  button.setButton("out+100k", "+100k", function()
+    cfg.targetOutput = clamp(cfg.targetOutput + 100000, cfg.outputMin, cfg.outputMax)
+    saveCfg()
+  end, 23, y2, 29, y2+1, nil, nil, colors.gray)
 
-  -- info text is drawn separately per monitor by f helpers in renderAll()
+  button.screen(monitor)
 end
 
-local function renderAll(ri, statusLine, actionLine)
-  for _, m in ipairs(monitors) do
-    local mx, my = m.getSize()
-    local mon = { monitor = m, X = mx, Y = my }
-
-    m.setTextScale(0.5)
-    m.setBackgroundColor(colors.black)
-    m.clear()
-
-    -- draw static info
-    f.draw_text(mon, 2, 5, "Status:", colors.white, colors.black)
-    f.draw_text(mon, 12, 5, statusLine, colors.white, colors.black)
-
-    f.draw_text(mon, 2, 7, "Temp:", colors.white, colors.black)
-    f.draw_text(mon, 12, 7, string.format("%.1fC", ri.temperature), getTempColor(ri.temperature), colors.black)
-
-    local fieldPct = pct(ri.fieldStrength, ri.maxFieldStrength)
-    local satPct = pct(ri.energySaturation, ri.maxEnergySaturation)
-
-    f.draw_text(mon, 2, 9, "Field:", colors.white, colors.black)
-    f.draw_text(mon, 12, 9, string.format("%.2f%%", fieldPct), getPctColor(fieldPct, 50, settings.get("lowFieldSoft")), colors.black)
-
-    f.draw_text(mon, 2, 10, "Sat:", colors.white, colors.black)
-    f.draw_text(mon, 12, 10, string.format("%.2f%%", satPct), getPctColor(satPct, 60, 30), colors.black)
-
-    f.draw_text(mon, 2, 12, "Gen:", colors.white, colors.black)
-    f.draw_text(mon, 12, 12, formatInt(ri.generationRate).." rf/t", colors.lime, colors.black)
-
-    f.draw_text(mon, 2, 13, "Field In:", colors.white, colors.black)
-    f.draw_text(mon, 12, 13, formatInt(ri.fieldDrainRate).." rf/t", colors.lightBlue, colors.black)
-
-    f.draw_text(mon, 2, 15, "Gate OUT:", colors.white, colors.black)
-    f.draw_text(mon, 12, 15, formatInt(gateGet(gateOut)).." rf/t", colors.lightBlue, colors.black)
-
-    f.draw_text(mon, 2, 16, "Gate IN:", colors.white, colors.black)
-    f.draw_text(mon, 12, 16, formatInt(gateGet(gateIn)).." rf/t", colors.lightBlue, colors.black)
-
-    f.draw_text(mon, 2, 22, actionLine, colors.white, colors.black)
-
-    -- Draw buttons on this monitor
-    button.screen(m)
-  end
+local function initUi()
+  monitor.setTextScale(0.5)
+  monitor.setBackgroundColor(colors.black)
+  monitor.clear()
+  monitor.setCursorPos(1,1)
+  monitor.setTextColor(colors.white)
+  setButtons()
 end
 
 -- =========================
--- Control logic
+-- Control state machine
 -- =========================
-local function getModeParams()
-  local mode = settings.get("mode")
-  if mode == "stable" then
-    return {
-      outMax = settings.get("outMaxStable"),
-      tempSoft = settings.get("tempSoftStable"),
-      rampStep = settings.get("rampStepStable"),
-      rampInterval = settings.get("rampIntervalStable"),
-    }
-  end
-  return {
-    outMax = settings.get("outMaxFill"),
-    tempSoft = settings.get("tempSoftFill"),
-    rampStep = settings.get("rampStepFill"),
-    rampInterval = settings.get("rampIntervalFill"),
-  }
+local STATE_NORMAL   = "NORMAL"
+local STATE_WARN     = "WARN"
+local STATE_CRIT     = "CRIT"
+local STATE_FAILSAFE = "FAILSAFE"
+local STATE_SHUTDOWN = "SHUTDOWN"
+
+local state = STATE_NORMAL
+local lastTemp = nil
+local lastTempTime = nil
+local safetyClampOut = nil
+
+local function classify(temp, fieldP)
+  if temp >= cfg.tempShutdown then return STATE_SHUTDOWN end
+  if fieldP <= cfg.fieldFail then return STATE_FAILSAFE end
+  if temp >= cfg.tempCrit or fieldP <= cfg.fieldCrit then return STATE_CRIT end
+  if temp >= cfg.tempWarn or fieldP <= cfg.fieldWarn then return STATE_WARN end
+  return STATE_NORMAL
 end
 
-local function desiredOutput(ri)
-  local p = getModeParams()
-  local target = p.outMax
+local function computeTempRate(temp, now)
+  if not lastTemp or not lastTempTime then
+    lastTemp, lastTempTime = temp, now
+    return 0
+  end
+  local dt = now - lastTempTime
+  if dt <= 0 then return 0 end
+  local rate = (temp - lastTemp) / dt
+  lastTemp, lastTempTime = temp, now
+  return rate
+end
 
-  -- stable mode: regulate around saturation target
-  if settings.get("mode") == "stable" then
-    local satPct = pct(ri.energySaturation, ri.maxEnergySaturation)
-    local satT = settings.get("satTarget")
-    local band = settings.get("satBand")
-    if satPct > satT + band then
-      target = math.max(0, math.floor(target * 0.6))
-    elseif satPct < satT - band then
-      target = math.min(p.outMax, math.floor(target * 1.0))
+local function getFuelPercent(ri)
+  local used = pct(ri.fuelConversion, ri.maxFuelConversion)
+  return clamp(100 - used, 0, 100)
+end
+
+local function desiredFieldTarget()
+  return (cfg.mode == MODE_FILL) and cfg.fieldTargetFill or cfg.fieldTargetStable
+end
+
+local function controlTick()
+  local ri = reactor.getReactorInfo()
+  if not ri then error("Reactor invalid: getReactorInfo returned nil") end
+
+  local now = os.clock()
+  local temp = tonumber(ri.temperature) or 0
+  local fieldP = pct(ri.fieldStrength, ri.maxFieldStrength)
+  local satP = pct(ri.energySaturation, ri.maxEnergySaturation)
+  local fuelP = getFuelPercent(ri)
+  local gen = tonumber(ri.generationRate) or 0
+  local fieldIn = tonumber(ri.fieldInputRate) or 0
+  local status = tostring(ri.status or "unknown")
+  local tempRate = computeTempRate(temp, now)
+
+  local newState = classify(temp, fieldP)
+
+  -- Hard actions
+  if newState == STATE_SHUTDOWN then
+    state = STATE_SHUTDOWN
+    reactorStop(reactor)
+    setLow(inputGate, cfg.inputMax)
+    setLow(outputGate, 0)
+    safetyClampOut = 0
+  elseif newState == STATE_FAILSAFE then
+    state = STATE_FAILSAFE
+    reactorStop(reactor)
+    setLow(inputGate, cfg.inputMax)
+    setLow(outputGate, 0)
+    safetyClampOut = 0
+  else
+    if state == STATE_FAILSAFE then
+      if fieldP >= cfg.fieldRelease and temp < cfg.tempCrit then
+        safetyClampOut = nil
+        state = newState
+        if cfg.autoCharge then reactorCharge(reactor) end
+        if cfg.autoActivate then reactorActivate(reactor) end
+      else
+        setLow(inputGate, cfg.inputMax)
+        setLow(outputGate, 0)
+      end
+    else
+      state = newState
     end
   end
 
-  -- temperature throttle (soft)
-  local tSoft = p.tempSoft
-  local tHard = settings.get("maxTemp")
-  if ri.temperature >= tSoft then
-    local factor = 1 - ((ri.temperature - tSoft) / math.max(1, (tHard - tSoft)))
-    factor = clamp(factor, 0, 1)
-    target = math.floor(target * factor)
+  -- Output application
+  local appliedOut = cfg.targetOutput
+  local inCrit = (state == STATE_CRIT) or (state == STATE_SHUTDOWN) or (state == STATE_FAILSAFE)
+
+  if inCrit then
+    local curOut = getLow(outputGate)
+    if not safetyClampOut then safetyClampOut = curOut end
+
+    local sev = 0
+    if temp >= cfg.tempCrit then sev = sev + (temp - cfg.tempCrit) / 200 end
+    if fieldP <= cfg.fieldCrit then sev = sev + (cfg.fieldCrit - fieldP) / 2 end
+    if tempRate > 50 then sev = sev + 1 end
+
+    local drop = 200000 * clamp(sev, 0, 10)
+    safetyClampOut = clamp((safetyClampOut or curOut) - drop, cfg.outputMin, cfg.outputMax)
+    appliedOut = math.min(cfg.targetOutput, safetyClampOut)
+  else
+    safetyClampOut = nil
+    appliedOut = cfg.targetOutput
   end
 
-  -- field/saturation throttle (soft)
-  local fieldPct = pct(ri.fieldStrength, ri.maxFieldStrength)
-  local satPct = pct(ri.energySaturation, ri.maxEnergySaturation)
-  if fieldPct <= settings.get("lowFieldSoft") or satPct <= 25 then
-    target = math.floor(target * 0.5)
+  setLow(outputGate, clamp(appliedOut, cfg.outputMin, cfg.outputMax))
+
+  -- Recover output under WARN
+  if temp < cfg.tempWarn and fieldP > cfg.fieldWarn then
+    setLow(outputGate, clamp(cfg.targetOutput, cfg.outputMin, cfg.outputMax))
   end
 
-  return clamp(target, 0, p.outMax)
+  -- Field control (mode speed differs)
+  local targetField = desiredFieldTarget()
+  local curIn = getLow(inputGate)
+  local step = (cfg.mode == MODE_FILL) and cfg.fillStep or cfg.stableStep
+
+  if state == STATE_WARN or state == STATE_CRIT then
+    step = step * cfg.critStepMul
+  end
+
+  if tempRate > 60 then step = step * 1.75
+  elseif tempRate > 30 then step = step * 1.35 end
+
+  local err = targetField - fieldP
+  local newIn = curIn
+  if math.abs(err) >= 0.5 then
+    newIn = (err > 0) and (curIn + step) or (curIn - step)
+  end
+
+  -- Force upward when field is low
+  if fieldP <= cfg.fieldWarn then newIn = curIn + step * 2 end
+  if fieldP <= cfg.fieldCrit then newIn = curIn + step * 4 end
+
+  newIn = clamp(newIn, cfg.inputMin, cfg.inputMax)
+  setLow(inputGate, newIn)
+
+  -- UI
+  local drawPeriod = 1 / cfg.uiFps
+  if now - lastDraw >= drawPeriod then
+    lastDraw = now
+
+    drawIfChanged("mode", 7, string.format("Mode: %s | Target OUT: %s", cfg.mode, fmtNum(cfg.targetOutput)), colors.white)
+    drawIfChanged("state", 8, string.format("State: %s | Stat: %s", state, status), colors.white)
+
+    drawIfChanged("temp", 10, string.format("Temp: %sC (dT %.1f/s)  W %d C %d SD %d",
+      fmtNum(temp), tempRate, cfg.tempWarn, cfg.tempCrit, cfg.tempShutdown),
+      (temp >= cfg.tempCrit) and colors.red or (temp >= cfg.tempWarn and colors.orange or colors.lime))
+
+    drawIfChanged("field", 11, string.format("Field: %.2f%%  W %d C %d F %d REL %d",
+      fieldP, cfg.fieldWarn, cfg.fieldCrit, cfg.fieldFail, cfg.fieldRelease),
+      (fieldP <= cfg.fieldCrit) and colors.red or (fieldP <= cfg.fieldWarn and colors.orange or colors.lime))
+
+    drawIfChanged("satfuel", 12, string.format("Saturation: %.2f%% | Fuel: %.2f%%", satP, fuelP), colors.white)
+    drawIfChanged("rates", 13, string.format("Gen: %s/t | FieldIn: %s/t", fmtNum(gen), fmtNum(fieldIn)), colors.white)
+    drawIfChanged("gates", 14, string.format("Gate IN: %s | Gate OUT: %s", fmtNum(getLow(inputGate)), fmtNum(getLow(outputGate))), colors.white)
+
+    local bw = math.max(10, monX - 12)
+    drawIfChanged("bar_field", 16, "Field ["..bar(bw, fieldP).."]", colors.white)
+    drawIfChanged("bar_sat",   17, "Sat   ["..bar(bw, satP).."]", colors.white)
+    drawIfChanged("bar_fuel",  18, "Fuel  ["..bar(bw, fuelP).."]", colors.white)
+  end
 end
 
-local lastOutSet = 0
-local lastRampTime = 0
-local lastIn = gateGet(gateIn)
-local lastLogTime = 0
+-- =========================
+-- Main
+-- =========================
+loadCfg()
+initUi()
 
-local function computeInputGate(ri)
-  -- Same formula idea as original StormFusions:
-  -- desiredIn = fieldDrainRate / (1 - targetStrength)
-  local targetStrength = settings.get("targetStrength")
-  local denom = (1 - (targetStrength / 100))
-  if denom < 0.05 then denom = 0.05 end
-  local desired = ri.fieldDrainRate / denom
-
-  desired = clamp(desired, settings.get("inMin"), settings.get("inMax"))
-
-  -- smoothing
-  local alpha = clamp(settings.get("inputSmooth"), 0, 1)
-  local newIn = math.floor(lastIn + (desired - lastIn) * alpha)
-  newIn = clamp(newIn, settings.get("inMin"), settings.get("inMax"))
-  lastIn = newIn
-  return newIn
-end
-
-local function checkEmergency(ri)
-  local fieldPct = pct(ri.fieldStrength, ri.maxFieldStrength)
-  local fuelPct = 100 - pct(ri.fuelConversion, ri.maxFuelConversion)
-
-  if fuelPct <= 10 then return "Fuel Low" end
-  if ri.status == "running" and fieldPct <= settings.get("lowFieldHard") then return "Field Critical" end
-  if ri.temperature >= settings.get("maxTemp") then return "Overheat" end
-  return nil
-end
+setLow(outputGate, clamp(cfg.targetOutput, cfg.outputMin, cfg.outputMax))
+if getLow(inputGate) < cfg.inputMin then setLow(inputGate, cfg.inputMin) end
 
 local function mainLoop()
   while true do
-    local ri = reactor.getReactorInfo()
-    if not ri then
-      sleep(0.5)
-    else
-      local fieldPct = pct(ri.fieldStrength, ri.maxFieldStrength)
-      local satPct = pct(ri.energySaturation, ri.maxEnergySaturation)
-
-      -- emergency handling
-      local reason = checkEmergency(ri)
-      local actionLine = "OK"
-      if reason then
-        pcall(function() reactor.stopReactor() end)
-        actionLine = "EMERGENCY: "..reason.." -> STOP"
-        alarm("crit", true)
-        logEvent("EMERGENCY: "..reason)
-      else
-        -- warning alarm
-        local warn = (ri.temperature >= getModeParams().tempSoft) or (fieldPct <= settings.get("lowFieldSoft")) or (satPct <= 25)
-        alarm(warn and "warn" or "warn", warn)
-
-        -- input gate control
-        if ri.status == "running" then
-          local newIn = computeInputGate(ri)
-          pcall(function() gateSet(gateIn, newIn) end)
-        elseif ri.status == "warming_up" then
-          -- help charge faster
-          pcall(function() gateSet(gateIn, math.max(gateGet(gateIn), 900000)) end)
-        end
-
-        -- output control (ramp towards desired)
-        local now = os.clock()
-        local p = getModeParams()
-        if now - lastRampTime >= p.rampInterval then
-          local want = desiredOutput(ri)
-          local cur = gateGet(gateOut)
-          local nextOut = cur
-          if cur < want then nextOut = math.min(want, cur + p.rampStep) end
-          if cur > want then nextOut = math.max(want, cur - p.rampStep) end
-          if nextOut ~= cur then
-            pcall(function() gateSet(gateOut, nextOut) end)
-          end
-          lastRampTime = now
-          lastOutSet = want
-        end
-      end
-
-      -- status line
-      local statusLine = tostring(ri.status)
-
-      -- buttons (global table) + render
-      drawUI(ri)
-      renderAll(ri, statusLine, actionLine)
-
-      -- DEV logging (1 Hz)
-      if settings.get("devMode") then
-        local nowMs = os.epoch("utc")
-        if nowMs - lastLogTime >= 1000 then
-          local line = table.concat({
-            tostring(nowMs),
-            tostring(ri.status),
-            string.format("%.1f", ri.temperature),
-            string.format("%.2f", pct(ri.fieldStrength, ri.maxFieldStrength)),
-            string.format("%.2f", pct(ri.energySaturation, ri.maxEnergySaturation)),
-            tostring(ri.generationRate),
-            tostring(ri.fieldDrainRate),
-            tostring(gateGet(gateOut)),
-            tostring(gateGet(gateIn)),
-            tostring(ri.fuelConversion),
-            tostring(ri.fieldDrainRate),
-            ""
-          }, ",")
-          appendLine("logs/reactor.csv", line)
-          lastLogTime = nowMs
-        end
-      end
-    end
-
-    sleep(0.1)
+    controlTick()
+    sleep(cfg.loopDt)
   end
 end
 
--- Run: UI clicks + main loop
--- Run main loop; if the button API is available, also listen for monitor clicks.
-local function _run()
-  if type(button) == "table" and type(button.clickEvent) == "function" then
-    parallel.waitForAny(mainLoop, function() button.clickEvent() end)
-  else
-    -- Headless fallback (no UI): keep reactor control running instead of crashing.
-    if type(logEvent) == "function" then
-      logEvent("WARN: button.clickEvent missing -> running without monitor UI")
-    end
-    mainLoop()
-  end
-end
-
-_run()
+parallel.waitForAny(mainLoop, button.clickEvent)
