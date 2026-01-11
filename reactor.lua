@@ -513,5 +513,4 @@ drawFrame()
 setupButtons()
 setAction("Running ("..S("mode")..")", colors.lightBlue)
 
-parallel.waitForAny(button.clickEvent, uiLoop, controlLoop)
-
+parallel.waitForAny(button.clickEvent, uiLoop, controlLoop, alarmLoop)
