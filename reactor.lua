@@ -537,4 +537,17 @@ local function mainLoop()
 end
 
 -- Run: UI clicks + main loop
-parallel.waitForAny(mainLoop, button.clickEvent)
+-- Run main loop; if the button API is available, also listen for monitor clicks.
+local function _run()
+  if type(button) == "table" and type(button.clickEvent) == "function" then
+    parallel.waitForAny(mainLoop, function() button.clickEvent() end)
+  else
+    -- Headless fallback (no UI): keep reactor control running instead of crashing.
+    if type(logEvent) == "function" then
+      logEvent("WARN: button.clickEvent missing -> running without monitor UI")
+    end
+    mainLoop()
+  end
+end
+
+_run()

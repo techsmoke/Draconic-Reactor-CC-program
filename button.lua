@@ -1,29 +1,17 @@
--- Multi-monitor button helper (techsmoke)
--- CC:Tweaked os.loadAPI() compatible:
---  - NO 'local button = {}'
---  - NO 'return button'
---
--- Backwards compatible API used by reactor.lua:
+-- button.lua
+-- Minimal Button API for CC:Tweaked (os.loadAPI compatible)
+-- Provides:
 --   button.setButton(...)
 --   button.clearTable()
---   button.screen([monitor])
---   button.clickEvent()
+--   button.screen([monitor])     -- draw buttons (all known monitors or one)
+--   button.clickEvent()          -- blocking monitor_touch loop
+--   button.setMonitors(list)     -- set monitor peripherals explicitly (optional)
 --
--- Optional:
---   button.setMonitors({monitor1, monitor2, ...})
+-- This file MUST NOT use `local button = {}` or `return button` when loaded via os.loadAPI.
 
 button = button or {}
 
--- store button definitions inside global table to remain compatible with older scripts
--- (some scripts iterate pairs(button) and expect the definitions there)
-local _internalKeys = {
-  setMonitors=true, clearTable=true, setButton=true, screen=true, checkxy=true, clickEvent=true
-}
-
-local function _isButtonDef(v)
-  return type(v) == "table" and v.xmin ~= nil and v.ymin ~= nil and v.xmax ~= nil and v.ymax ~= nil
-end
-
+-- wrapped monitor peripherals we draw on
 local _monitors = {}
 
 local function _defaultMonitors()
@@ -45,10 +33,15 @@ function button.setMonitors(ms)
   end
 end
 
+-- Backwards compat (some forks used this name)
+button.setMonitorsS = button.setMonitors
+button.setMonitor = function(m) button.setMonitors({ m }) end
+
+-- Remove only button definitions; keep API functions intact
 function button.clearTable()
-  for k, v in pairs(button) do
-    if _isButtonDef(v) then
-      button[k] = nil
+  for name, data in pairs(button) do
+    if type(data) == "table" and data.xmin ~= nil then
+      button[name] = nil
     end
   end
 end
@@ -57,32 +50,35 @@ function button.setButton(name, title, func, xmin, ymin, xmax, ymax, elem, elem2
   button[name] = {
     title = tostring(title or ""),
     func  = func,
-    xmin  = xmin, ymin = ymin, xmax = xmax, ymax = ymax,
+    xmin  = xmin,
+    ymin  = ymin,
+    xmax  = xmax,
+    ymax  = ymax,
     color = color or colors.blue,
     elem  = elem,
     elem2 = elem2,
   }
 end
 
-local function _fill(m, b)
-  m.setBackgroundColor(b.color or colors.blue)
+local function _fill(m, bData)
+  m.setBackgroundColor(bData.color)
   m.setTextColor(colors.white)
 
-  local yMid  = math.floor((b.ymin + b.ymax) / 2)
-  local width = (b.xmax - b.xmin)
-  local title = tostring(b.title or "")
-  local xMid  = math.floor((width + 1 - #title) / 2)
+  local yspot = math.floor((bData.ymin + bData.ymax) / 2)
+  local width = (bData.xmax - bData.xmin)
+  local title = tostring(bData.title or "")
+  local xspot = math.floor((width - #title) / 2)
 
-  for y = b.ymin, b.ymax do
-    m.setCursorPos(b.xmin, y)
-    if y == yMid then
-      if #title > (width + 1) then
-        m.write(string.sub(title, 1, width + 1))
-      else
-        m.write(string.rep(" ", math.max(0, xMid)))
-        m.write(title)
-        local rest = (width + 1) - (xMid + #title)
-        if rest > 0 then m.write(string.rep(" ", rest)) end
+  for y = bData.ymin, bData.ymax do
+    m.setCursorPos(bData.xmin, y)
+    if y == yspot then
+      for x = 0, width do
+        if x == xspot then
+          m.write(title)
+          x = x + #title - 1
+        else
+          m.write(" ")
+        end
       end
     else
       m.write(string.rep(" ", width + 1))
@@ -90,7 +86,6 @@ local function _fill(m, b)
   end
 
   m.setBackgroundColor(colors.black)
-  m.setTextColor(colors.white)
 end
 
 function button.screen(targetMonitor)
@@ -106,20 +101,20 @@ function button.screen(targetMonitor)
   end
 
   for _, m in ipairs(ms) do
-    for _, v in pairs(button) do
-      if _isButtonDef(v) then
-        _fill(m, v)
+    for _, data in pairs(button) do
+      if type(data) == "table" and data.xmin ~= nil then
+        _fill(m, data)
       end
     end
   end
 end
 
 function button.checkxy(x, y)
-  for _, v in pairs(button) do
-    if _isButtonDef(v) then
-      if y >= v.ymin and y <= v.ymax and x >= v.xmin and x <= v.xmax then
-        if type(v.func) == "function" then
-          v.func(v.elem, v.elem2)
+  for _, data in pairs(button) do
+    if type(data) == "table" and data.xmin ~= nil then
+      if y >= data.ymin and y <= data.ymax and x >= data.xmin and x <= data.xmax then
+        if type(data.func) == "function" then
+          data.func(data.elem, data.elem2)
         end
         return true
       end
@@ -128,8 +123,6 @@ function button.checkxy(x, y)
   return false
 end
 
--- IMPORTANT: clickEvent MUST be a function reference (for parallel.waitForAny)
--- so reactor.lua can call: parallel.waitForAny(mainLoop, button.clickEvent)
 function button.clickEvent()
   while true do
     local _, _, x, y = os.pullEvent("monitor_touch")
