@@ -513,4 +513,12 @@ drawFrame()
 setupButtons()
 setAction("Running ("..S("mode")..")", colors.lightBlue)
 
-parallel.waitForAny(button.clickEvent, uiLoop, controlLoop, alarmLoop)
+local function _buttonLoop()
+  if type(button) == "table" and type(button.clickEvent) == "function" then
+    return button.clickEvent()
+  end
+  -- Fallback: don't crash if button API failed to load.
+  while true do os.pullEvent("monitor_touch") end
+end
+
+parallel.waitForAny(_buttonLoop, uiLoop, controlLoop, alarmLoop)
