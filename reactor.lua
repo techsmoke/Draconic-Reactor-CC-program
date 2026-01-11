@@ -514,3 +514,4 @@ setupButtons()
 setAction("Running ("..S("mode")..")", colors.lightBlue)
 
 parallel.waitForAny(button.clickEvent, uiLoop, controlLoop)
+
