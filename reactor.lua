@@ -78,8 +78,8 @@ local cfg = {
   -- ===== PATCH: tiered generation control (ONLY behavioural change) =====
   genLowToMidUp     = 4200000,  -- 4.2M
   genMidToLowDown   = 3800000,  -- 3.8M
-  genMidToHighUp    = 6200000,  -- 6.2M
-  genHighToMidDown  = 5800000,  -- 5.8M
+  genMidToHighUp    = 5200000,  -- 6.2M
+  genHighToMidDown  = 4900000,  -- 5.8M
 
   fieldTargetLow = 25,
   fieldTargetMid = 50,
